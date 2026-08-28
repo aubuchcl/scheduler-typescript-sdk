@@ -1,70 +1,61 @@
 # syntax=docker/dockerfile:1
 ARG NODE_VERSION=24-slim
 
-##############################################################################
-# sdk - pack the client out of this repo
-#
-# Once a fixed release is on npm this whole stage goes away, and the runtime
-# below installs the published package instead:
-#
-#     npm i --prefix /opt/sdk @cycleplatform/scheduler-api-client@0.3.0
-#
-# It cannot do that today: the 0.2.0 currently on npm is unimportable. Its
-# exports map points at ./dist/index.js and ./dist/index.umd.cjs, and the
-# tarball ships neither (it has index.mjs and index.umd.js).
-##############################################################################
-FROM node:${NODE_VERSION} AS sdk
-WORKDIR /build
-
-COPY package.json package-lock.json ./
-# The root package's `prepare` script is `vite build`, which needs ./src -
-# nothing but the manifests exists at this layer, so skip lifecycle scripts.
-RUN npm ci --ignore-scripts
-
-COPY tsconfig.json vite.config.ts ./
-COPY src ./src
-
-# Not `npm run build:lib`: that regenerates src/generated/types.ts from the
-# api-spec submodule, which is not in the build context. The generated types
-# are committed, so vite runs straight against them.
-RUN npx vite build \
-    && npm pack --ignore-scripts --pack-destination /out
-
-##############################################################################
-# runtime - plain node, with the client resolvable from anywhere
-##############################################################################
 FROM node:${NODE_VERSION}
 
-COPY --from=sdk /out/ /tmp/sdk/
+# npm needs a git binary to resolve the github: spec below. node:*-slim does
+# not ship one (the full node:24 image does). This whole layer disappears once
+# the client is installable from npm.
+RUN apt-get update \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+    git \
+    && rm -rf /var/lib/apt/lists/*
 
 # The client is installed under /opt/sdk and exposed as /node_modules. Node's
 # resolver walks up the directory tree looking for node_modules, so a script
-# anywhere on the filesystem imports the client with no package.json and no
-# local install:
+# anywhere on the filesystem imports it with no package.json and no local
+# install. NODE_PATH is deliberately not used - it only affects CJS require(),
+# and ESM resolution ignores it. The symlink also keeps a stray /package.json
+# off the filesystem root, where it would decide the module type of every
+# loose .js file on the box.
 #
-#     docker run -v ./job.mjs:/app/job.mjs IMAGE node job.mjs
+# Installed from git rather than npm on purpose: the published 0.2.0 cannot be
+# imported at all (its exports map points at ./dist/index.js and
+# ./dist/index.umd.cjs; the tarball ships neither). A git install runs the
+# package's own `prepare` script, which builds dist correctly, and yields
+# 0.3.0 - the version that has the message bus. Pinned to a commit so the
+# image is reproducible; bump it deliberately.
 #
-# NODE_PATH is deliberately not used - it only affects CJS require(), and ESM
-# resolution ignores it, which would leave `import` broken in a "type":
-# "module" world. The symlink keeps a stray /package.json off the filesystem
-# root, where it would otherwise decide the module type of every loose .js
-# file on the box.
+# Once a fixed release is on npm, this becomes a one-liner and the git layer
+# above can go:
+#
+#     npm i --prefix /opt/sdk @cycleplatform/scheduler-api-client
+#
+ARG SDK_REF=d8956aa27232767694986edde701a3c68d22d4bb
 RUN mkdir -p /opt/sdk \
     && cd /opt/sdk \
     && npm init -y > /dev/null \
-    && npm i /tmp/sdk/*.tgz \
+    && npm i "github:cycleplatform/scheduler-api-client-ts#${SDK_REF}" \
     && ln -s /opt/sdk/node_modules /node_modules \
-    && rm -rf /tmp/sdk \
     && npm cache clean --force
 
-RUN mkdir -p /app && chown node:node /app
 WORKDIR /app
+
+# .js rather than .mjs is fine here: /app has no package.json, so Node's
+# module syntax detection (default since 22.7, and this is 24) reads the
+# import statements and loads them as ESM. Adding a package.json with
+# "type": "commonjs" to /app is the one thing that would break them.
+COPY --chown=node:node publish.js consume.js ./
+
 USER node
 
-# Default to the scheduler reachable from inside a Cycle environment. The
-# access key is per-deployment, so it is not baked in.
+# The scheduler reachable from inside a Cycle environment. ACCESS_TOKEN is
+# per-deployment, so it is not baked in.
 ENV BASE_URL="http://env-scheduler"
 
-# The base image's own default. Nothing is baked in as an entrypoint, so this
-# stays a runtime you hand a script to rather than an image wired to one.
+# The base image's own default - nothing is wired in as an entrypoint, so this
+# stays a runtime you hand a script to:
+#
+#     docker run --rm -e ACCESS_TOKEN=... IMAGE node consume.js --topics orders.created
+#
 CMD ["node"]
