@@ -1,0 +1,80 @@
+# 1 — smoke: any topic, default {} payload
+R  node consume.js --max 1
+P  node publish.js smoke.test
+
+# 2 — explicit payload
+R  node consume.js --max 1
+P  node publish.js orders.created '{"id":"1234"}'
+
+# 3 — topic filter, match
+R  node consume.js orders.created --max 1
+P  node publish.js orders.created '{"id":"1234"}'
+
+# 4 — topic filter, MISS: expect "sent":0, receiver keeps waiting (Ctrl-C it)
+R  node consume.js orders.created --max 1
+P  node publish.js billing.charged '{"amount":100}'
+
+# 5 — multiple topics
+R  node consume.js orders.created,orders.shipped --max 2
+P  node publish.js orders.created '{"id":"1"}' && node publish.js orders.shipped '{"id":"1"}'
+
+# 6 — flag form instead of positional
+R  node consume.js --topics=orders.created --max 1
+P  node publish.js --topic=orders.created --payload='{"id":"1234"}'
+
+# 7 — named channel, matched
+R  node consume.js --channel=jobs --max 1
+P  node publish.js --topic=work.queued --payload='{"job":"a"}' --channel=jobs
+
+# 8 — channel MISMATCH: default publish, jobs receiver. Expect nothing (Ctrl-C)
+R  node consume.js --channel=jobs --max 1
+P  node publish.js work.queued '{"job":"a"}'
+
+# 9 — channel + topic together
+R  node consume.js work.queued --channel=jobs --max 1
+P  node publish.js --topic=work.queued --payload='{"job":"b"}' --channel=jobs
+
+# 10 — annotations, pretty printed
+R  node consume.js --max 1 --pretty
+P  node publish.js audit.event '{"who":"chris"}' --annotation=source=cli --annotation=env=dev
+
+# 11 — DURABILITY: run P FIRST, then R. Should replay the missed message.
+P  node publish.js orders.created '{"id":"late"}' --ttl=120
+R  node consume.js orders.created --max 1
+
+# 12 — no TTL: run P FIRST, then R. Should NOT arrive (Ctrl-C)
+P  node publish.js orders.created '{"id":"lost"}'
+R  node consume.js orders.created --max 1
+
+# 13 — non-JSON payload as a string
+R  node consume.js --max 1
+P  node publish.js log.line 'plain text, not json' --raw
+
+# 14 — payload piped on stdin
+R  node consume.js --max 1
+P  echo '{"from":"stdin"}' | node publish.js pipe.test
+
+# 15 — nested + array payload
+R  node consume.js --max 1 --pretty
+P  node publish.js batch.created '{"ids":[1,2,3],"meta":{"src":"cli"}}'
+
+# 16 — unicode round trip
+R  node consume.js --max 1
+P  node publish.js i18n.test '{"msg":"héllo wörld 日本語 🚀"}'
+
+# 17 — fan-out: TWO receiver shells, then publish. Expect "sent":2
+R  node consume.js fanout.test --max 1        # shell A
+R  node consume.js fanout.test --max 1        # shell B
+P  node publish.js fanout.test '{"n":1}'
+
+# 18 — burst of 5
+R  node consume.js burst.test --max 5
+P  for i in 1 2 3 4 5; do node publish.js burst.test "{\"n\":$i}"; done
+
+# 19 — env vars instead of flags
+R  TOPICS=env.test node consume.js --max 1
+P  TOPIC=env.test PAYLOAD='{"v":1}' node publish.js
+
+# 20 — bad key: both should fail fast with 403, no retry loop
+R  ACCESS_TOKEN=not-a-real-key node consume.js --max 1
+P  ACCESS_TOKEN=not-a-real-key node publish.js auth.test
